@@ -9,7 +9,7 @@ import httpx
 load_dotenv()
 
 from gemini_provider import GeminiProvider
-from schemas import ChatRequest, ChatResponse, SummarizeRequest, SummarizeResponse
+from schemas import ChatRequest, ChatResponse
 
 
 @asynccontextmanager
@@ -37,13 +37,6 @@ async def ready(provider: GeminiProvider = Depends(get_provider)) -> dict[str, s
     except (httpx.HTTPError, ClientError, asyncio.TimeoutError) as exc:
         raise HTTPException(status_code=503, detail="Gemini provider not ready") from exc
     return {"status": "ready"}
-
-
-@app.post("/summarize", response_model=SummarizeResponse)
-async def summarize(
-    body: SummarizeRequest, provider: GeminiProvider = Depends(get_provider)
-) -> SummarizeResponse:
-    return await provider.generate_response(body)
 
 
 @app.post("/chat", response_model=ChatResponse)

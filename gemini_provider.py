@@ -1,12 +1,10 @@
 import asyncio
 import os
-import json
 from typing import Final
 
 import httpx
 from google import genai
 from google.genai.errors import ClientError
-from pydantic import ValidationError
 from tenacity import (
     retry,
     retry_if_exception,
@@ -14,17 +12,18 @@ from tenacity import (
     wait_exponential,
 )
 
-from schemas import ChatRequest, ChatResponse, SummarizeRequest, SummarizeResponse
-
-_SUMMARIZE_SYSTEM_PROMPT: Final[str] = (
-    "You are a technical document assistant. Follow the instruction precisely "
-    "and base your answer only on the document provided."
-    "Return the response as a JSON object with keys 'tldr' and 'bullets'."
-)
+from schemas import ChatRequest, ChatResponse
 
 _CHAT_SYSTEM_PROMPT: Final[str] = (
-    "You are a helpful assistant. Answer concisely and use prior turns in the "
-    "conversation when relevant."
+    "You are a helpful assistant. Use the provided conversation summary for "
+    "prior context. Answer the user's latest message concisely."
+)
+
+_SUMMARY_UPDATE_SYSTEM_PROMPT: Final[str] = (
+    "You maintain a rolling summary of a conversation. Given the previous "
+    "summary and the latest user/assistant exchange, produce an updated "
+    "summary that incorporates the new information. Keep the result under "
+    "200 words. Output plain text only—no preamble, headings, or markdown."
 )
 
 
@@ -33,7 +32,7 @@ class InvalidGeminiResponseError(ValueError):
 
 
 def _is_invalid_response_error(exc: BaseException) -> bool:
-    return isinstance(exc, (json.JSONDecodeError, InvalidGeminiResponseError))
+    return isinstance(exc, InvalidGeminiResponseError)
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -44,40 +43,15 @@ def _is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, ClientError) and exc.code == 429
 
 
-def _parse_summary_response(content: str | None) -> SummarizeResponse:
-    if content is None:
-        raise InvalidGeminiResponseError("Gemini returned empty message content")
-    try:
-        return SummarizeResponse.model_validate_json(content)
-    except (json.JSONDecodeError, ValidationError) as exc:
-        raise InvalidGeminiResponseError("Gemini returned invalid summary JSON") from exc
-
-
 class GeminiProvider:
     def __init__(self) -> None:
         self.api_key = os.getenv("GEMINI_API_KEY")
         self.model = os.getenv("GEMINI_MODEL")
 
         self.client = genai.Client(api_key=self.api_key)
-        self._sessions: dict[str, list[dict[str, str]]] = {}
+        self.sessions: dict[str, str] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
-
-    @retry(
-        retry=retry_if_exception(_is_retryable),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=30),
-        reraise=True,
-    )
-    async def _chat_completion(
-        self, messages: list[dict[str, str]]
-    ) -> SummarizeResponse:
-        response = await self.client.aio.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            extra_body={"response_mime_type": "application/json"},
-        )
-        return _parse_summary_response(response.choices[0].message.content)
 
     @retry(
         retry=retry_if_exception(_is_retryable),
@@ -95,29 +69,72 @@ class GeminiProvider:
             raise InvalidGeminiResponseError("Gemini returned empty chat content")
         return content
 
-    async def generate_response(self, request: SummarizeRequest) -> SummarizeResponse:
-        user_message = (
-            f"Instruction:\n{request.instruction}\n\nDocument:\n{request.content}"
+    async def update_rolling_summary(
+        self,
+        current_summary: str,
+        user_message: str,
+        assistant_reply: str,
+    ) -> str:
+        user_content = (
+            f"Previous summary:\n{current_summary.strip() or '(none yet)'}\n\n"
+            f"New user message:\n{user_message}\n\n"
+            f"Assistant reply:\n{assistant_reply}\n\n"
+            "Updated summary (under 200 words):"
         )
-        return await self._chat_completion(
+        return await self._chat_completion_text(
             [
-                {"role": "system", "content": _SUMMARIZE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
+                {"role": "system", "content": _SUMMARY_UPDATE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
             ]
         )
+
+    async def _background_refresh_summary(
+        self,
+        session_id: str,
+        summary_used_for_turn: str,
+        user_message: str,
+        assistant_reply: str,
+    ) -> None:
+        try:
+            updated = await self.update_rolling_summary(
+                summary_used_for_turn, user_message, assistant_reply
+            )
+            text = updated.strip()
+            if not text:
+                return
+            async with self._locks_guard:
+                lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+            async with lock:
+                self.sessions[session_id] = text
+        except Exception:
+            pass
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         async with self._locks_guard:
             lock = self._session_locks.setdefault(request.session_id, asyncio.Lock())
         async with lock:
-            history = self._sessions.setdefault(request.session_id, [])
-            history.append({"role": "user", "content": request.message})
-            messages: list[dict[str, str]] = [
+            summary = self.sessions.get(request.session_id, "")
+
+        if summary.strip():
+            user_turn = (
+                f"Conversation summary so far:\n{summary.strip()}\n\n"
+                f"User message:\n{request.message}"
+            )
+        else:
+            user_turn = request.message
+
+        reply = await self._chat_completion_text(
+            [
                 {"role": "system", "content": _CHAT_SYSTEM_PROMPT},
-                *history,
+                {"role": "user", "content": user_turn},
             ]
-            reply = await self._chat_completion_text(messages)
-            history.append({"role": "assistant", "content": reply})
+        )
+
+        asyncio.create_task(
+            self._background_refresh_summary(
+                request.session_id, summary, request.message, reply
+            )
+        )
         return ChatResponse(reply=reply)
 
     async def check_readiness(self) -> None:
