@@ -8,21 +8,28 @@ import httpx
 
 load_dotenv()
 
-from gemini_provider import GeminiProvider
+from logging_setup import RequestLoggingMiddleware, configure_logging
+
+configure_logging()
+
+from llm_provider import LLMProvider
+from tracing import get_client
 from schemas import ChatRequest, ChatResponse
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.provider = GeminiProvider()
+    app.state.provider = LLMProvider()
     yield
+    get_client().shutdown()
 
 
-def get_provider(request: Request) -> GeminiProvider:
+def get_provider(request: Request) -> LLMProvider:
     return request.app.state.provider
 
 
 app = FastAPI(title="AI microservice", version="0.1.0", lifespan=lifespan)
+app.add_middleware(RequestLoggingMiddleware)
 
 
 @app.get("/live")
