@@ -7,9 +7,6 @@ Strategy
 * Redis is replaced by fakeredis, so tests are hermetic and fast.
 """
 
-import pytest
-
-
 VALID_KEY = "test-secret"
 HEADERS = {"X-API-Key": VALID_KEY}
 

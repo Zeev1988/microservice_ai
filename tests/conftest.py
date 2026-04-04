@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
+
+import os
+import sys
 
 import fakeredis.aioredis as fakeredis
 import pytest
 from httpx import ASGITransport, AsyncClient
-
-import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 # Set env vars before importing the app so FastAPI / main.py reads them.
