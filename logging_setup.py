@@ -46,6 +46,21 @@ def log_rolling_summary_refresh_failed(session_id: str, latency_ms: float) -> No
     )
 
 
+def log_session_reset(session_id: str, *, existed: bool) -> None:
+    _llm_log.info(
+        "session_reset",
+        extra={"session_id": session_id, "had_data": existed},
+    )
+
+
+def log_rate_limit_exceeded(action: str, credential_fingerprint: str) -> None:
+    """credential_fingerprint is a one-way hash — never log raw API keys."""
+    _llm_log.warning(
+        "rate_limit_exceeded",
+        extra={"action": action, "credential_fingerprint": credential_fingerprint},
+    )
+
+
 class JsonLogFormatter(logging.Formatter):
     """One JSON object per line (Loki / ELK / CloudWatch friendly)."""
 

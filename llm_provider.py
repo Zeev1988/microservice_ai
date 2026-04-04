@@ -10,6 +10,7 @@ from logging_setup import (
     log_llm_chat_completion,
     log_rolling_summary_refresh_complete,
     log_rolling_summary_refresh_failed,
+    log_session_reset,
 )
 from tenacity import (
     retry,
@@ -19,7 +20,7 @@ from tenacity import (
 )
 
 from schemas import ChatRequest, ChatResponse
-from session_store import Exchange, SessionState, SessionStore
+from session_store import Exchange, SessionStore
 from tracing import (
     get_client,
     otel_attached,
@@ -213,7 +214,8 @@ class LLMProvider:
             span.update(metadata={"summary_refresh_latency_ms": elapsed_ms, "summary_refresh_status": "ok"})
             log_rolling_summary_refresh_complete(session_id, elapsed_ms)
 
-            if text := updated.strip():
+            if updated.strip():
+                text = updated.strip()
                 async with self._store.session_lock(session_id):
                     state = await self._store.get_state(session_id)
                     state.summary = text
@@ -255,7 +257,7 @@ class LLMProvider:
                     state.buffer.append(Exchange(user=request.message, assistant=reply))
                     await self._store.set_state(sid, state)
                     if len(state.buffer) >= _BUFFER_SIZE:
-                        self._schedule_background(sid, state.summary, list(state.buffer))
+                        self._schedule_background(sid, state.summary, list[Exchange](state.buffer))
 
                 return ChatResponse(session_id=sid, reply=reply)
 
@@ -263,6 +265,12 @@ class LLMProvider:
     async def _run_in_context(ctx, coro) -> None:
         with otel_attached(ctx):
             await coro
+
+    async def reset_session(self, session_id: str) -> bool:
+        """Soft-delete session data. Returns True if a session existed."""
+        existed = await self._store.soft_delete_state(session_id)
+        log_session_reset(session_id, existed=existed)
+        return existed
 
     async def check_readiness(self) -> None:
         await self._backend.ping()

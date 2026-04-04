@@ -1,4 +1,4 @@
-"""Redis-backed session store: data structures, serialisation, and distributed locking."""
+"""Redis-backed session store: data structures, serialisation, distributed locking, and rate limiting."""
 
 from __future__ import annotations
 
@@ -15,6 +15,9 @@ SESSION_TTL_SECONDS: Final[int] = 60 * 60  # 1 hour
 
 # Max time any process may hold a session lock; prevents deadlock on crash.
 _LOCK_TIMEOUT_SECONDS: Final[float] = 30.0
+
+# Soft-deleted sessions are kept for 24 h before Redis expires them.
+_PENDING_DELETE_TTL_SECONDS: Final[int] = 60 * 60 * 24
 
 
 @dataclass
@@ -52,6 +55,14 @@ class SessionStore:
     def _lock_key(session_id: str) -> str:
         return f"session_lock:{session_id}"
 
+    @staticmethod
+    def _pending_delete_key(session_id: str) -> str:
+        return f"session:pending_delete:{session_id}"
+
+    @staticmethod
+    def _rate_limit_key(action: str, client_id: str) -> str:
+        return f"rate_limit:{action}:{client_id}"
+
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
@@ -72,6 +83,43 @@ class SessionStore:
             "buffer": [{"user": ex.user, "assistant": ex.assistant} for ex in state.buffer],
         })
         await self._redis.set(self._key(session_id), payload, ex=SESSION_TTL_SECONDS)
+
+    async def soft_delete_state(self, session_id: str) -> bool:
+        """Soft-delete: archive live state for 24 h, then remove the live key.
+
+        Returns True if a live session existed, False if there was nothing to delete.
+        The archived copy lets ops / support recover accidental deletions within the window.
+        """
+        async with self.session_lock(session_id):
+            raw = await self._redis.get(self._key(session_id))
+            if raw is None:
+                return False
+            await self._redis.set(
+                self._pending_delete_key(session_id),
+                raw,
+                ex=_PENDING_DELETE_TTL_SECONDS,
+            )
+            await self._redis.delete(self._key(session_id))
+        return True
+
+    # ------------------------------------------------------------------
+    # Rate limiting
+    # ------------------------------------------------------------------
+
+    async def is_rate_limited(
+        self, action: str, client_id: str, *, limit: int, window_seconds: int
+    ) -> bool:
+        """Fixed-window rate check. Returns True if the caller has exceeded the limit.
+
+        ``client_id`` should be a non-secret stable id (e.g. SHA-256 of API key), never the raw key.
+        Uses Redis INCR + EXPIRE so the counter is distributed across all workers.
+        """
+        key = self._rate_limit_key(action, client_id)
+        count = await self._redis.incr(key)
+        if count == 1:
+            # First hit — set the expiry for this window.
+            await self._redis.expire(key, window_seconds)
+        return count > limit
 
     # ------------------------------------------------------------------
     # Distributed lock
