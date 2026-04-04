@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Lint + Test
+  # ---------------------------------------------------------------------------
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      # All LLM calls are stubbed in tests — real secrets are never needed here.
+      # Non-empty placeholders satisfy startup validation without touching production creds.
+      GEMINI_API_KEY: ci-placeholder
+      GEMINI_MODEL: gemini-pro
+      LANGFUSE_PUBLIC_KEY: ci-placeholder
+      LANGFUSE_SECRET_KEY: ci-placeholder
+      API_KEY: ci-test-secret
+      REDIS_URL: redis://localhost:6379
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Run tests
+        run: pytest --tb=short -q
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Docker build (only runs if test job passes)
+  # ---------------------------------------------------------------------------
+  build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: test   # blocks until test job succeeds
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t ai-service:${{ github.sha }} .
+
+      # ------------------------------------------------------------------
+      # Push to registry — uncomment and configure when ready for deploy.
+      # ------------------------------------------------------------------
+      # - name: Authenticate to Google Artifact Registry
+      #   uses: google-github-actions/auth@v2
+      #   with:
+      #     credentials_json: ${{ secrets.GCP_SA_KEY }}
+      #
+      # - name: Push image
+      #   run: |
+      #     docker tag ai-service:${{ github.sha }} \
+      #       ${{ secrets.GAR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/ai-service/ai-service:${{ github.sha }}
+      #     docker push \
+      #       ${{ secrets.GAR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/ai-service/ai-service:${{ github.sha }}
