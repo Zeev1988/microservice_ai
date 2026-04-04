@@ -10,6 +10,7 @@ import sys
 import fakeredis.aioredis as fakeredis
 import pytest
 from httpx import ASGITransport, AsyncClient
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 # Set env vars before importing the app so FastAPI / main.py reads them.
@@ -18,6 +19,9 @@ os.environ.setdefault("GEMINI_API_KEY", "fake")
 os.environ.setdefault("GEMINI_MODEL", "gemini-pro")
 os.environ.setdefault("LANGFUSE_PUBLIC_KEY", "fake-pub")
 os.environ.setdefault("LANGFUSE_SECRET_KEY", "fake-sec")
+# Prevent Langfuse / OTLP from exporting during tests (fake creds → 401 and
+# exporter errors can break ASGI handling under Python 3.11+ exception groups).
+os.environ["OTEL_SDK_DISABLED"] = "true"
 
 from main import app
 from session_store import SessionStore
