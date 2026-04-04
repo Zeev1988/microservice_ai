@@ -42,30 +42,6 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> str
 
 
 # ---------------------------------------------------------------------------
-# Security: rate limiting for destructive actions
-# ---------------------------------------------------------------------------
-
-# Allow at most 1 reset per 5 minutes per API key.
-_RESET_RATE_LIMIT = 1
-_RESET_RATE_WINDOW_SECONDS = 60 * 5
-
-
-async def check_reset_rate_limit(
-    provider: LLMProvider = Depends(lambda req: req.app.state.provider),
-    credential_fingerprint: str = Depends(verify_api_key),
-) -> None:
-    limited = await provider._store.is_rate_limited(
-        action="reset",
-        client_id=credential_fingerprint,
-        limit=_RESET_RATE_LIMIT,
-        window_seconds=_RESET_RATE_WINDOW_SECONDS,
-    )
-    if limited:
-        log_rate_limit_exceeded("reset", credential_fingerprint)
-        raise HTTPException(status_code=429, detail="Too many reset requests. Try again later.")
-
-
-# ---------------------------------------------------------------------------
 # App lifecycle
 # ---------------------------------------------------------------------------
 
@@ -80,6 +56,31 @@ async def lifespan(app: FastAPI):
 
 def get_provider(request: Request) -> LLMProvider:
     return request.app.state.provider
+
+
+# ---------------------------------------------------------------------------
+# Security: rate limiting for destructive actions
+# (defined after get_provider so Depends(get_provider) resolves at import time)
+# ---------------------------------------------------------------------------
+
+# Allow at most 1 reset per 5 minutes per API key.
+_RESET_RATE_LIMIT = 1
+_RESET_RATE_WINDOW_SECONDS = 60 * 5
+
+
+async def check_reset_rate_limit(
+    provider: LLMProvider = Depends(get_provider),
+    credential_fingerprint: str = Depends(verify_api_key),
+) -> None:
+    limited = await provider._store.is_rate_limited(
+        action="reset",
+        client_id=credential_fingerprint,
+        limit=_RESET_RATE_LIMIT,
+        window_seconds=_RESET_RATE_WINDOW_SECONDS,
+    )
+    if limited:
+        log_rate_limit_exceeded("reset", credential_fingerprint)
+        raise HTTPException(status_code=429, detail="Too many reset requests. Try again later.")
 
 
 # ---------------------------------------------------------------------------
