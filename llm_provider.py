@@ -57,18 +57,12 @@ def _is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, ClientError) and exc.code == 429
 
 
-@retry(
-    retry=retry_if_exception(_is_retryable),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=30),
-    reraise=True,
-)
-async def _gemini_call(
+async def _gemini_call_raw(
     client: genai.Client,
     model: str,
     messages: list[dict[str, str]],
 ) -> tuple[str, object]:
-    """Raw Gemini API call. Returns (content, raw_response)."""
+    """Single raw Gemini API call, no retry logic."""
     response = await client.aio.chat.completions.create(
         model=model,
         messages=messages,
@@ -77,6 +71,23 @@ async def _gemini_call(
     if content is None or not content.strip():
         raise InvalidLLMResponseError("LLM returned empty content")
     return content, response
+
+
+# User-facing: fail fast — 3 attempts, max 10 s wait.
+_gemini_call_interactive = retry(
+    retry=retry_if_exception(_is_retryable),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    reraise=True,
+)(_gemini_call_raw)
+
+# Background: prioritise eventual success — 8 attempts, up to 5 min wait.
+_gemini_call_background = retry(
+    retry=retry_if_exception(_is_retryable),
+    stop=stop_after_attempt(8),
+    wait=wait_exponential(multiplier=2, min=2, max=300),
+    reraise=True,
+)(_gemini_call_raw)
 
 
 class _GeminiClient:
@@ -95,7 +106,12 @@ class _GeminiClient:
     async def complete(
         self, messages: list[dict[str, str]]
     ) -> tuple[str, object]:
-        return await _gemini_call(self._client, self.model, messages)
+        return await _gemini_call_interactive(self._client, self.model, messages)
+
+    async def complete_background(
+        self, messages: list[dict[str, str]]
+    ) -> tuple[str, object]:
+        return await _gemini_call_background(self._client, self.model, messages)
 
     async def ping(self) -> None:
         """Lightweight connectivity check."""
@@ -144,6 +160,7 @@ class LLMProvider:
         messages: list[dict[str, str]],
         *,
         observation_name: str = "llm-completion",
+        background: bool = False,
     ) -> str:
         langfuse = get_client()
         with langfuse.start_as_current_observation(
@@ -152,7 +169,8 @@ class LLMProvider:
             model=self.model,
         ) as gen:
             gen.update(input=messages)
-            content, response = await self._backend.complete(messages)
+            call = self._backend.complete_background if background else self._backend.complete
+            content, response = await call(messages)
             usage = usage_details_for_langfuse(response)
             gen.update(output=content, usage_details=usage or {})
             log_llm_chat_completion(observation_name, usage)
@@ -176,6 +194,7 @@ class LLMProvider:
                 {"role": "user", "content": user_content},
             ],
             observation_name="llm-summary-refresh",
+            background=True,
         )
 
     async def _background_refresh_summary(
