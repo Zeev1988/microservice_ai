@@ -3,22 +3,19 @@ import asyncio
 import hashlib
 import os
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from google.genai.errors import ClientError
-import httpx
-
-load_dotenv()
 
 from logging_setup import RequestLoggingMiddleware, configure_logging, log_rate_limit_exceeded
-
-configure_logging()
-
 from llm_provider import LLMProvider
+from schemas import ChatRequest, ChatResponse
 from session_store import SessionStore
 from tracing import get_client
-from schemas import ChatRequest, ChatResponse
 
+load_dotenv()
+configure_logging()
 
 # ---------------------------------------------------------------------------
 # Security: API key auth
@@ -44,6 +41,7 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> str
 # ---------------------------------------------------------------------------
 # App lifecycle
 # ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
