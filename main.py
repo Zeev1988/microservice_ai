@@ -13,14 +13,17 @@ from logging_setup import RequestLoggingMiddleware, configure_logging
 configure_logging()
 
 from llm_provider import LLMProvider
+from session_store import SessionStore
 from tracing import get_client
 from schemas import ChatRequest, ChatResponse
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.provider = LLMProvider()
+    store = SessionStore.from_env()
+    app.state.provider = LLMProvider(store)
     yield
+    await store.close()
     get_client().shutdown()
 
 
@@ -38,16 +41,16 @@ async def live() -> dict[str, str]:
 
 
 @app.get("/ready")
-async def ready(provider: GeminiProvider = Depends(get_provider)) -> dict[str, str]:
+async def ready(provider: LLMProvider = Depends(get_provider)) -> dict[str, str]:
     try:
         await asyncio.wait_for(provider.check_readiness(), timeout=5)
     except (httpx.HTTPError, ClientError, asyncio.TimeoutError) as exc:
-        raise HTTPException(status_code=503, detail="Gemini provider not ready") from exc
+        raise HTTPException(status_code=503, detail="Service not ready") from exc
     return {"status": "ready"}
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
-    body: ChatRequest, provider: GeminiProvider = Depends(get_provider)
+    body: ChatRequest, provider: LLMProvider = Depends(get_provider)
 ) -> ChatResponse:
     return await provider.chat(body)

@@ -9,4 +9,5 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    session_id: str = Field(..., min_length=1, description="Client-owned session identifier.")
     reply: str = Field(..., min_length=1, description="Assistant reply for this turn.")

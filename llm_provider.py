@@ -1,7 +1,7 @@
 import asyncio
 import os
 import time
-from typing import Final, Protocol, runtime_checkable
+from typing import Final
 
 import httpx
 from google import genai
@@ -19,6 +19,7 @@ from tenacity import (
 )
 
 from schemas import ChatRequest, ChatResponse
+from session_store import Exchange, SessionState, SessionStore
 from tracing import (
     get_client,
     otel_attached,
@@ -33,13 +34,14 @@ _CHAT_SYSTEM_PROMPT: Final[str] = (
 )
 
 _SUMMARY_UPDATE_SYSTEM_PROMPT: Final[str] = (
-    "You maintain a rolling summary of a conversation. Given the previous "
-    "summary and the latest user/assistant exchange, produce an updated "
-    "summary that incorporates the new information. Keep the result under "
-    "200 words. Output plain text only—no preamble, headings, or markdown."
+    "You maintain a rolling summary of a conversation. You will be given the "
+    "previous summary and a batch of recent exchanges. Perform inductive "
+    "reasoning: identify what new facts, decisions, or context must be "
+    "preserved, merge them with the old summary, and return an updated summary "
+    "under 200 words. Output plain text only—no preamble, headings, or markdown."
 )
 
-_SESSION_TTL_SECONDS: Final[int] = 60 * 60  # 1 hour
+_BUFFER_SIZE: Final[int] = 3  # exchanges before a summary flush is triggered
 
 
 class InvalidLLMResponseError(ValueError):
@@ -103,18 +105,13 @@ class _GeminiClient:
         self.model = model
         self._client = genai.Client(api_key=api_key)
 
-    async def complete(
-        self, messages: list[dict[str, str]]
-    ) -> tuple[str, object]:
+    async def complete(self, messages: list[dict[str, str]]) -> tuple[str, object]:
         return await _gemini_call_interactive(self._client, self.model, messages)
 
-    async def complete_background(
-        self, messages: list[dict[str, str]]
-    ) -> tuple[str, object]:
+    async def complete_background(self, messages: list[dict[str, str]]) -> tuple[str, object]:
         return await _gemini_call_background(self._client, self.model, messages)
 
     async def ping(self) -> None:
-        """Lightweight connectivity check."""
         await self._client.aio.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": "ping"}],
@@ -127,33 +124,22 @@ class _GeminiClient:
 # ---------------------------------------------------------------------------
 
 class LLMProvider:
-    def __init__(self) -> None:
+    def __init__(self, store: SessionStore) -> None:
         self._backend = _GeminiClient()
+        self._store = store
         self.model = self._backend.model
 
-        # session_id -> (summary, last_access_time)
-        self.sessions: dict[str, tuple[str, float]] = {}
-        self._session_locks: dict[str, asyncio.Lock] = {}
-        self._locks_guard = asyncio.Lock()
-
-    def _evict_stale_sessions(self) -> None:
-        cutoff = time.monotonic() - _SESSION_TTL_SECONDS
-        stale = [sid for sid, (_, ts) in self.sessions.items() if ts < cutoff]
-        for sid in stale:
-            self.sessions.pop(sid, None)
-            self._session_locks.pop(sid, None)
-
-    def _get_summary(self, session_id: str) -> str:
-        entry = self.sessions.get(session_id)
-        if entry is None:
-            return ""
-        summary, _ = entry
-        self.sessions[session_id] = (summary, time.monotonic())
-        return summary
-
-    def _set_summary(self, session_id: str, summary: str) -> None:
-        self.sessions[session_id] = (summary, time.monotonic())
-        self._evict_stale_sessions()
+    def _schedule_background(
+        self, session_id: str, snapshot_summary: str, snapshot_buffer: list[Exchange]
+    ) -> None:
+        """Fire-and-forget the summary refresh, keeping it on the current trace."""
+        ctx = otel_context_current()
+        asyncio.create_task(
+            self._run_in_context(
+                ctx,
+                self._background_refresh_summary(session_id, snapshot_summary, snapshot_buffer),
+            )
+        )
 
     async def _chat_completion_text(
         self,
@@ -179,13 +165,14 @@ class LLMProvider:
     async def update_rolling_summary(
         self,
         current_summary: str,
-        user_message: str,
-        assistant_reply: str,
+        buffer: list[Exchange],
     ) -> str:
+        exchanges_text = "\n\n".join(
+            f"User: {ex.user}\nAssistant: {ex.assistant}" for ex in buffer
+        )
         user_content = (
             f"Previous summary:\n{current_summary.strip() or '(none yet)'}\n\n"
-            f"New user message:\n{user_message}\n\n"
-            f"Assistant reply:\n{assistant_reply}\n\n"
+            f"Recent exchanges ({len(buffer)}):\n{exchanges_text}\n\n"
             "Updated summary (under 200 words):"
         )
         return await self._chat_completion_text(
@@ -200,77 +187,59 @@ class LLMProvider:
     async def _background_refresh_summary(
         self,
         session_id: str,
-        summary_used_for_turn: str,
-        user_message: str,
-        assistant_reply: str,
+        snapshot_summary: str,
+        snapshot_buffer: list[Exchange],
     ) -> None:
         langfuse = get_client()
-        with langfuse.start_as_current_observation(
-            as_type="span",
-            name="rolling-summary-update",
-        ) as span:
-            span.update(
-                input={
-                    "session_id": session_id,
-                    "user_message": user_message,
-                    "assistant_reply_preview": assistant_reply[:2000],
-                }
-            )
+        with langfuse.start_as_current_observation(as_type="span", name="rolling-summary-update") as span:
+            span.update(input={
+                "session_id": session_id,
+                "buffer_size": len(snapshot_buffer),
+                "exchanges_preview": [
+                    {"user": ex.user[:200], "assistant": ex.assistant[:200]}
+                    for ex in snapshot_buffer
+                ],
+            })
             t0 = time.perf_counter()
             try:
-                updated = await self.update_rolling_summary(
-                    summary_used_for_turn, user_message, assistant_reply
-                )
+                updated = await self.update_rolling_summary(snapshot_summary, snapshot_buffer)
             except Exception:
                 elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
-                span.update(
-                    metadata={
-                        "summary_refresh_latency_ms": elapsed_ms,
-                        "summary_refresh_status": "error",
-                    }
-                )
+                span.update(metadata={"summary_refresh_latency_ms": elapsed_ms, "summary_refresh_status": "error"})
                 log_rolling_summary_refresh_failed(session_id, elapsed_ms)
                 return
 
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
-            span.update(
-                metadata={
-                    "summary_refresh_latency_ms": elapsed_ms,
-                    "summary_refresh_status": "ok",
-                }
-            )
+            span.update(metadata={"summary_refresh_latency_ms": elapsed_ms, "summary_refresh_status": "ok"})
             log_rolling_summary_refresh_complete(session_id, elapsed_ms)
 
-            text = updated.strip()
-            if not text:
-                return
-            async with self._locks_guard:
-                lock = self._session_locks.setdefault(session_id, asyncio.Lock())
-            async with lock:
-                self._set_summary(session_id, text)
+            if text := updated.strip():
+                async with self._store.session_lock(session_id):
+                    state = await self._store.get_state(session_id)
+                    state.summary = text
+                    # Trim only the exchanges that were included in this flush.
+                    state.buffer = state.buffer[len(snapshot_buffer):]
+                    await self._store.set_state(session_id, state)
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
+        sid = request.session_id
         langfuse = get_client()
         with langfuse.start_as_current_observation(as_type="span", name="chat-turn"):
-            with propagate_attributes(session_id=request.session_id):
-                async with self._locks_guard:
-                    lock = self._session_locks.setdefault(request.session_id, asyncio.Lock())
-                async with lock:
-                    summary = self._get_summary(request.session_id)
+            with propagate_attributes(session_id=sid):
+                async with self._store.session_lock(sid):
+                    state = await self._store.get_state(sid)
+                    summary, buffer_len = state.summary, len(state.buffer)
 
                 user_turn = (
                     f"Conversation summary so far:\n{summary.strip()}\n\n"
                     f"User message:\n{request.message}"
-                    if summary.strip()
-                    else request.message
+                    if summary.strip() else request.message
                 )
-
-                langfuse.update_current_span(
-                    input={
-                        "user_message": request.message,
-                        "had_prior_summary": bool(summary.strip()),
-                    }
-                )
+                langfuse.update_current_span(input={
+                    "user_message": request.message,
+                    "had_prior_summary": bool(summary.strip()),
+                    "buffer_len": buffer_len,
+                })
 
                 reply = await self._chat_completion_text(
                     [
@@ -279,19 +248,16 @@ class LLMProvider:
                     ],
                     observation_name="llm-chat-reply",
                 )
-
                 langfuse.update_current_span(output={"reply": reply})
 
-                parent_ctx = otel_context_current()
-                asyncio.create_task(
-                    self._run_in_context(
-                        parent_ctx,
-                        self._background_refresh_summary(
-                            request.session_id, summary, request.message, reply
-                        ),
-                    )
-                )
-                return ChatResponse(reply=reply)
+                async with self._store.session_lock(sid):
+                    state = await self._store.get_state(sid)
+                    state.buffer.append(Exchange(user=request.message, assistant=reply))
+                    await self._store.set_state(sid, state)
+                    if len(state.buffer) >= _BUFFER_SIZE:
+                        self._schedule_background(sid, state.summary, list(state.buffer))
+
+                return ChatResponse(session_id=sid, reply=reply)
 
     @staticmethod
     async def _run_in_context(ctx, coro) -> None:
@@ -300,3 +266,4 @@ class LLMProvider:
 
     async def check_readiness(self) -> None:
         await self._backend.ping()
+        await self._store.ping()
