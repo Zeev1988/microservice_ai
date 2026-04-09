@@ -64,6 +64,7 @@ def stub_llm_provider(session_store):
     provider._store = session_store
     provider.model = "stub-model"
     provider._chat_completion_text = AsyncMock(return_value="Hello from stub!")
+    provider._chat_with_tools = AsyncMock(return_value="Hello from stub!")
     return provider
 
 
