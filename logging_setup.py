@@ -61,6 +61,15 @@ def log_rate_limit_exceeded(action: str, credential_fingerprint: str) -> None:
     )
 
 
+def log_tool_execution_failed(tool_name: str) -> None:
+    """Call from inside an ``except`` block so the traceback is recorded."""
+    _llm_log.exception("tool_execution_failed", extra={"tool": tool_name})
+
+
+def log_tool_loop_cap_reached(max_iterations: int) -> None:
+    _llm_log.warning("tool_loop_cap_reached", extra={"max_iterations": max_iterations})
+
+
 class JsonLogFormatter(logging.Formatter):
     """One JSON object per line (Loki / ELK / CloudWatch friendly)."""
 

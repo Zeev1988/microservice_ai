@@ -13,6 +13,8 @@ from logging_setup import (
     log_rolling_summary_refresh_complete,
     log_rolling_summary_refresh_failed,
     log_session_reset,
+    log_tool_execution_failed,
+    log_tool_loop_cap_reached,
 )
 from tenacity import (
     retry,
@@ -188,11 +190,45 @@ class _GeminiClient:
     def _execute_tool_calls(
         function_calls: list[Any],
     ) -> list[types.Part]:
-        """Run every tool requested by the model and return the result parts."""
+        """Run every tool requested by the model and return the result parts.
+
+        Each tool call is isolated: a failure in one tool produces a structured
+        error message fed back to the model instead of crashing the loop.
+        """
+        langfuse = get_client()
         result_parts: list[types.Part] = []
         for fc in function_calls:
             fn = _TOOL_REGISTRY.get(fc.name)
-            tool_output: Any = fn(**dict(fc.args)) if fn else {"error": f"Unknown tool: {fc.name}"}
+            args = dict(fc.args)
+            with langfuse.start_as_current_observation(
+                as_type="span", name=f"tool-call:{fc.name}"
+            ) as span:
+                span.update(input={"tool": fc.name, "args": args})
+                if fn is None:
+                    tool_output: Any = {"error": f"Unknown tool: {fc.name}"}
+                    span.update(
+                        level="ERROR",
+                        metadata={"reason": "unknown_tool"},
+                        output=tool_output,
+                    )
+                else:
+                    try:
+                        tool_output = fn(**args)
+                        span.update(output=tool_output)
+                    except Exception as exc:
+                        log_tool_execution_failed(fc.name)
+                        tool_output = {
+                            "error": (
+                                "Lab database is temporarily offline. "
+                                "I will answer based on my internal knowledge "
+                                "and suggest checking back later."
+                            )
+                        }
+                        span.update(
+                            level="ERROR",
+                            metadata={"exception": str(exc), "fallback": "internal_knowledge"},
+                            output=tool_output,
+                        )
             result_parts.append(
                 types.Part.from_function_response(
                     name=fc.name,
@@ -230,10 +266,7 @@ class _GeminiClient:
             )
 
         if cap_reached:
-            import logging
-            logging.getLogger("llm").warning(
-                "tool_loop_cap_reached", extra={"max_iterations": _MAX_TOOL_ITERATIONS}
-            )
+            log_tool_loop_cap_reached(_MAX_TOOL_ITERATIONS)
         return last_response
 
     async def complete_with_tools(
