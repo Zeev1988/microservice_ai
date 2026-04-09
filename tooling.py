@@ -7,6 +7,7 @@ from typing import Any
 from google.genai import types
 
 from session_store import SessionStore
+from vector_store import VectorStore
 
 GEMINI_TOOLS = [
     types.Tool(
@@ -32,7 +33,7 @@ GEMINI_TOOLS = [
                 name="save_research_note",
                 description=(
                     "Save a research note for the active session so the user can revisit "
-                    "interesting labs or findings later."
+                    "interesting labs or findings later. Only call after user confirms."
                 ),
                 parameters=types.Schema(
                     type=types.Type.OBJECT,
@@ -49,14 +50,37 @@ GEMINI_TOOLS = [
                     required=["session_id", "note"],
                 ),
             ),
+            types.FunctionDeclaration(
+                name="search_my_notes",
+                description=(
+                    "Semantically search the user's past research notes for this session. "
+                    "Use this when the user asks about something they previously found "
+                    "interesting or wants to recall earlier findings."
+                ),
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "session_id": types.Schema(
+                            type=types.Type.STRING,
+                            description="Session id used to scope the note search.",
+                        ),
+                        "query": types.Schema(
+                            type=types.Type.STRING,
+                            description="Natural-language query to find relevant past notes.",
+                        ),
+                    },
+                    required=["session_id", "query"],
+                ),
+            ),
         ]
     )
 ]
 
 
 class ToolExecutor:
-    def __init__(self, store: SessionStore) -> None:
+    def __init__(self, store: SessionStore, vector_store: VectorStore) -> None:
         self._store = store
+        self._vector_store = vector_store
 
     @staticmethod
     def search_research_labs(query: str) -> list[dict[str, Any]]:
@@ -77,9 +101,15 @@ class ToolExecutor:
         return results or labs
 
     async def save_research_note(self, session_id: str, note: str) -> dict[str, str]:
-        """Persist a note to Redis under the user's session."""
+        """Persist a note to both Redis (fast list) and the vector store (semantic search)."""
         await self._store.save_research_note(session_id, note)
+        await self._vector_store.add_note(session_id, note)
         return {"status": "saved", "session_id": session_id, "note": note}
+
+    async def search_my_notes(self, session_id: str, query: str) -> dict[str, Any]:
+        """Return the top-3 most semantically relevant past notes for *query*."""
+        hits = await self._vector_store.search_notes(session_id, query)
+        return {"results": hits, "count": len(hits)}
 
     async def execute(self, tool_name: str, args: dict[str, Any]) -> Any:
         if tool_name == "search_research_labs":
@@ -88,5 +118,10 @@ class ToolExecutor:
             return await self.save_research_note(
                 session_id=str(args.get("session_id", "")),
                 note=str(args.get("note", "")),
+            )
+        if tool_name == "search_my_notes":
+            return await self.search_my_notes(
+                session_id=str(args.get("session_id", "")),
+                query=str(args.get("query", "")),
             )
         raise ValueError(f"Unknown tool: {tool_name}")

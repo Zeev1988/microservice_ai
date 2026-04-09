@@ -26,6 +26,7 @@ from tenacity import (
 from schemas import ChatRequest, ChatResponse
 from session_store import Exchange, SessionStore
 from tooling import GEMINI_TOOLS, ToolExecutor
+from vector_store import VectorStore
 from tracing import (
     get_client,
     otel_attached,
@@ -48,7 +49,10 @@ _CHAT_SYSTEM_PROMPT: Final[str] = (
     "Only call search_research_labs once the user has confirmed a focus area. "
     "If the user says a lab is interesting, proactively ask whether they want "
     "you to save a research note for this session, and use save_research_note "
-    "only after the user confirms."
+    "only after the user confirms. "
+    "If the user asks about something they previously found interesting or wants "
+    "to recall earlier findings, use search_my_notes to retrieve relevant past notes "
+    "from their session before answering."
 )
 
 _SUMMARY_UPDATE_SYSTEM_PROMPT: Final[str] = (
@@ -139,6 +143,47 @@ class _GeminiClient:
         """Wrap a plain user string into the native Gemini Content format."""
         return [types.Content(role="user", parts=[types.Part.from_text(text=user_message)])]
 
+    @staticmethod
+    def _tool_failure_payload() -> dict[str, str]:
+        return {
+            "error": (
+                "Lab database is temporarily offline. "
+                "I will answer based on my internal knowledge "
+                "and suggest checking back later."
+            )
+        }
+
+    @staticmethod
+    def _part_from_tool_output(tool_name: str, tool_output: Any) -> types.Part:
+        return types.Part.from_function_response(
+            name=tool_name,
+            response={"result": json.dumps(tool_output)},
+        )
+
+    async def _execute_single_tool_call(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> types.Part:
+        langfuse = get_client()
+        with langfuse.start_as_current_observation(
+            as_type="span", name=f"tool-call:{tool_name}"
+        ) as span:
+            span.update(input={"tool": tool_name, "args": args})
+            try:
+                tool_output = await self._tool_executor.execute(tool_name, args)
+                span.update(output=tool_output)
+                return self._part_from_tool_output(tool_name, tool_output)
+            except Exception as exc:
+                log_tool_execution_failed(tool_name)
+                tool_output = self._tool_failure_payload()
+                span.update(
+                    level="ERROR",
+                    metadata={"exception": str(exc), "fallback": "internal_knowledge"},
+                    output=tool_output,
+                )
+                return self._part_from_tool_output(tool_name, tool_output)
+
     async def _execute_tool_calls(
         self,
         function_calls: list[Any],
@@ -150,39 +195,28 @@ class _GeminiClient:
         Each tool call is isolated: a failure in one tool produces a structured
         error message fed back to the model instead of crashing the loop.
         """
-        langfuse = get_client()
-        result_parts: list[types.Part] = []
+        normalized_calls: list[tuple[str, dict[str, Any]]] = []
         for fc in function_calls:
             args = dict(fc.args)
             if fc.name == "save_research_note" and "session_id" not in args:
                 args["session_id"] = session_id
-            with langfuse.start_as_current_observation(
-                as_type="span", name=f"tool-call:{fc.name}"
-            ) as span:
-                span.update(input={"tool": fc.name, "args": args})
-                try:
-                    tool_output = await self._tool_executor.execute(fc.name, args)
-                    span.update(output=tool_output)
-                except Exception as exc:
-                    log_tool_execution_failed(fc.name)
-                    tool_output = {
-                        "error": (
-                            "Lab database is temporarily offline. "
-                            "I will answer based on my internal knowledge "
-                            "and suggest checking back later."
-                        )
-                    }
-                    span.update(
-                        level="ERROR",
-                        metadata={"exception": str(exc), "fallback": "internal_knowledge"},
-                        output=tool_output,
-                    )
-            result_parts.append(
-                types.Part.from_function_response(
-                    name=fc.name,
-                    response={"result": json.dumps(tool_output)},
+            normalized_calls.append((fc.name, args))
+
+        tasks = [
+            self._execute_single_tool_call(tool_name, args)
+            for tool_name, args in normalized_calls
+        ]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        result_parts: list[types.Part] = []
+        for (tool_name, _args), raw in zip(normalized_calls, raw_results):
+            if isinstance(raw, Exception):
+                log_tool_execution_failed(tool_name)
+                result_parts.append(
+                    self._part_from_tool_output(tool_name, self._tool_failure_payload())
                 )
-            )
+                continue
+            result_parts.append(raw)
         return result_parts
 
     async def _react_loop(
@@ -252,9 +286,9 @@ class _GeminiClient:
 # ---------------------------------------------------------------------------
 
 class LLMProvider:
-    def __init__(self, store: SessionStore) -> None:
+    def __init__(self, store: SessionStore, vector_store: VectorStore) -> None:
         self._store = store
-        self._backend = _GeminiClient(ToolExecutor(store))
+        self._backend = _GeminiClient(ToolExecutor(store, vector_store))
         self.model = self._backend.model
 
     def _schedule_background(

@@ -13,6 +13,7 @@ from llm_provider import LLMProvider
 from schemas import ChatRequest, ChatResponse
 from session_store import SessionStore
 from tracing import get_client
+from vector_store import VectorStore
 
 load_dotenv()
 configure_logging()
@@ -46,7 +47,8 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> str
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store = SessionStore.from_env()
-    app.state.provider = LLMProvider(store)
+    vector_store = VectorStore.from_env()
+    app.state.provider = LLMProvider(store, vector_store)
     yield
     await store.close()
     get_client().shutdown()

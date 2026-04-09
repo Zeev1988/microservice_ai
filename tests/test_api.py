@@ -106,3 +106,23 @@ async def test_chat_returns_200_when_tool_raises(client, stub_llm_provider):
         json={"session_id": "session-tool-fail", "message": "Find me AI safety labs"},
     )
     assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# RAG: search_my_notes test
+# ---------------------------------------------------------------------------
+
+async def test_search_my_notes_returns_stub_results(stub_vector_store):
+    """search_my_notes delegates to VectorStore.search_notes and returns its results."""
+    from tooling import ToolExecutor
+    from unittest.mock import AsyncMock, MagicMock
+
+    stub_vector_store.search_notes = AsyncMock(return_value=[
+        {"note": "Anthropic focuses on AI safety", "similarity": 0.95},
+    ])
+    executor = ToolExecutor(store=MagicMock(), vector_store=stub_vector_store)
+    result = await executor.search_my_notes(session_id="s1", query="AI safety")
+
+    assert result["count"] == 1
+    assert result["results"][0]["similarity"] == 0.95
+    stub_vector_store.search_notes.assert_awaited_once_with("s1", "AI safety")

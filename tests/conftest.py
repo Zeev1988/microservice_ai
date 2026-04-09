@@ -26,6 +26,7 @@ os.environ["OTEL_SDK_DISABLED"] = "true"
 
 from main import app  # noqa: E402
 from session_store import SessionStore  # noqa: E402
+from vector_store import VectorStore  # noqa: E402
 
 
 @pytest.fixture
@@ -56,12 +57,22 @@ def session_store(fake_redis):
 
 
 @pytest.fixture
-def stub_llm_provider(session_store):
+def stub_vector_store():
+    """In-memory VectorStore with embedding calls stubbed out."""
+    store = VectorStore.__new__(VectorStore)
+    store.add_note = AsyncMock()
+    store.search_notes = AsyncMock(return_value=[])
+    return store
+
+
+@pytest.fixture
+def stub_llm_provider(session_store, stub_vector_store):
     """LLMProvider with the Gemini backend replaced by a simple stub."""
     from llm_provider import LLMProvider
 
     provider = LLMProvider.__new__(LLMProvider)
     provider._store = session_store
+    provider._vector_store = stub_vector_store
     provider.model = "stub-model"
     provider._chat_completion_text = AsyncMock(return_value="Hello from stub!")
     provider._chat_with_tools = AsyncMock(return_value="Hello from stub!")
