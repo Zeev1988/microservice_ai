@@ -7,13 +7,8 @@ Strategy
 * Redis is replaced by fakeredis, so tests are hermetic and fast.
 """
 import json
-from unittest.mock import patch
 
 from llm_provider import _GeminiClient
-
-
-def _raise_db_timeout(**_kwargs):
-    raise RuntimeError("DB timeout")
 
 VALID_KEY = "test-secret"
 HEADERS = {"X-API-Key": VALID_KEY}
@@ -87,16 +82,18 @@ async def test_chat_returns_200_when_tool_raises(client, stub_llm_provider):
     We bypass the stub's _chat_with_tools mock and exercise _execute_tool_calls
     directly to confirm the error path produces a structured Part (not a crash).
     """
-    with patch.dict(
-        "llm_provider._TOOL_REGISTRY",
-        {"search_research_labs": _raise_db_timeout},
-    ):
-        # Build a minimal fake function_call object.
-        class _FakeFC:
-            name = "search_research_labs"
-            args = {"query": "AI safety"}
+    class _FakeFC:
+        name = "search_research_labs"
+        args = {"query": "AI safety"}
 
-        parts = _GeminiClient._execute_tool_calls([_FakeFC()])
+    class _ExplodingExecutor:
+        async def execute(self, _tool_name, _args):
+            raise RuntimeError("DB timeout")
+
+    # Build a minimal Gemini client instance without running __init__.
+    fake_client = _GeminiClient.__new__(_GeminiClient)
+    fake_client._tool_executor = _ExplodingExecutor()
+    parts = await fake_client._execute_tool_calls([_FakeFC()], session_id="session-tool-fail")
 
     assert len(parts) == 1
     result = json.loads(parts[0].function_response.response["result"])

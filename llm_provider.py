@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import time
-from typing import Any, Callable, Final
+from typing import Any, Final
 
 import httpx
 from google import genai
@@ -25,6 +25,7 @@ from tenacity import (
 
 from schemas import ChatRequest, ChatResponse
 from session_store import Exchange, SessionStore
+from tooling import GEMINI_TOOLS, ToolExecutor
 from tracing import (
     get_client,
     otel_attached,
@@ -44,7 +45,10 @@ _CHAT_SYSTEM_PROMPT: Final[str] = (
     "When faced with ambiguous requests such as 'interesting projects' or "
     "'what should I explore', use the conversation summary and the user's "
     "professional background to suggest 3 specific research areas. "
-    "Only call search_research_labs once the user has confirmed a focus area."
+    "Only call search_research_labs once the user has confirmed a focus area. "
+    "If the user says a lab is interesting, proactively ask whether they want "
+    "you to save a research note for this session, and use save_research_note "
+    "only after the user confirms."
 )
 
 _SUMMARY_UPDATE_SYSTEM_PROMPT: Final[str] = (
@@ -64,58 +68,6 @@ _MAX_TOOL_ITERATIONS: Final[int] = 5  # guard against infinite tool loops
 
 class InvalidLLMResponseError(ValueError):
     pass
-
-
-# ---------------------------------------------------------------------------
-# Tool definitions — add new tools here; register them in _TOOL_REGISTRY
-# ---------------------------------------------------------------------------
-
-def search_research_labs(query: str) -> list[dict[str, Any]]:
-    """Return a dummy list of AI research labs whose name or topics match *query*."""
-    labs = [
-        {"name": "DeepMind", "topics": ["reinforcement learning", "protein folding", "AlphaCode"]},
-        {"name": "Anthropic", "topics": ["AI safety", "constitutional AI", "interpretability"]},
-        {"name": "OpenAI", "topics": ["GPT", "DALL-E", "Sora", "reasoning"]},
-        {"name": "MIT CSAIL", "topics": ["robotics", "natural language processing", "computer vision"]},
-        {"name": "Stanford HAI", "topics": ["human-centered AI", "policy", "ethics"]},
-        {"name": "Google Brain / Google DeepMind", "topics": ["transformers", "diffusion models", "Gemini"]},
-        {"name": "CMU LTI", "topics": ["NLP", "dialogue systems", "multimodal AI"]},
-    ]
-    q = query.lower()
-    results = [
-        lab for lab in labs
-        if q in lab["name"].lower() or any(q in t for t in lab["topics"])
-    ]
-    return results or labs  # fall back to full list if nothing matches
-
-
-_TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
-    "search_research_labs": search_research_labs,
-}
-
-_GEMINI_TOOLS = [
-    types.Tool(
-        function_declarations=[
-            types.FunctionDeclaration(
-                name="search_research_labs",
-                description=(
-                    "Search for AI / ML research labs by name or topic. "
-                    "Returns a list of matching labs with their research focus areas."
-                ),
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "query": types.Schema(
-                            type=types.Type.STRING,
-                            description="Lab name, research topic, or keyword to search for.",
-                        )
-                    },
-                    required=["query"],
-                ),
-            )
-        ]
-    )
-]
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +117,7 @@ _gemini_call_background = retry(
 class _GeminiClient:
     """Thin wrapper that owns the Gemini SDK client and exposes a provider-agnostic call."""
 
-    def __init__(self) -> None:
+    def __init__(self, tool_executor: ToolExecutor) -> None:
         api_key = os.getenv("GEMINI_API_KEY")
         model = os.getenv("GEMINI_MODEL")
         if not api_key:
@@ -174,6 +126,7 @@ class _GeminiClient:
             raise RuntimeError("GEMINI_MODEL is not set")
         self.model = model
         self._client = genai.Client(api_key=api_key)
+        self._tool_executor = tool_executor
 
     async def complete(self, messages: list[dict[str, str]]) -> tuple[str, object]:
         return await _gemini_call_interactive(self._client, self.model, messages)
@@ -186,9 +139,11 @@ class _GeminiClient:
         """Wrap a plain user string into the native Gemini Content format."""
         return [types.Content(role="user", parts=[types.Part.from_text(text=user_message)])]
 
-    @staticmethod
-    def _execute_tool_calls(
+    async def _execute_tool_calls(
+        self,
         function_calls: list[Any],
+        *,
+        session_id: str,
     ) -> list[types.Part]:
         """Run every tool requested by the model and return the result parts.
 
@@ -198,37 +153,30 @@ class _GeminiClient:
         langfuse = get_client()
         result_parts: list[types.Part] = []
         for fc in function_calls:
-            fn = _TOOL_REGISTRY.get(fc.name)
             args = dict(fc.args)
+            if fc.name == "save_research_note" and "session_id" not in args:
+                args["session_id"] = session_id
             with langfuse.start_as_current_observation(
                 as_type="span", name=f"tool-call:{fc.name}"
             ) as span:
                 span.update(input={"tool": fc.name, "args": args})
-                if fn is None:
-                    tool_output: Any = {"error": f"Unknown tool: {fc.name}"}
+                try:
+                    tool_output = await self._tool_executor.execute(fc.name, args)
+                    span.update(output=tool_output)
+                except Exception as exc:
+                    log_tool_execution_failed(fc.name)
+                    tool_output = {
+                        "error": (
+                            "Lab database is temporarily offline. "
+                            "I will answer based on my internal knowledge "
+                            "and suggest checking back later."
+                        )
+                    }
                     span.update(
                         level="ERROR",
-                        metadata={"reason": "unknown_tool"},
+                        metadata={"exception": str(exc), "fallback": "internal_knowledge"},
                         output=tool_output,
                     )
-                else:
-                    try:
-                        tool_output = fn(**args)
-                        span.update(output=tool_output)
-                    except Exception as exc:
-                        log_tool_execution_failed(fc.name)
-                        tool_output = {
-                            "error": (
-                                "Lab database is temporarily offline. "
-                                "I will answer based on my internal knowledge "
-                                "and suggest checking back later."
-                            )
-                        }
-                        span.update(
-                            level="ERROR",
-                            metadata={"exception": str(exc), "fallback": "internal_knowledge"},
-                            output=tool_output,
-                        )
             result_parts.append(
                 types.Part.from_function_response(
                     name=fc.name,
@@ -241,6 +189,8 @@ class _GeminiClient:
         self,
         contents: list[types.Content],
         config: types.GenerateContentConfig,
+        *,
+        session_id: str,
     ) -> object:
         """Drive the ReAct loop: call → tool-execute → repeat until model stops or cap hit."""
         last_response: object = None
@@ -262,7 +212,10 @@ class _GeminiClient:
 
             contents.append(response.candidates[0].content)
             contents.append(
-                types.Content(role="user", parts=self._execute_tool_calls(function_calls))
+                types.Content(
+                    role="user",
+                    parts=await self._execute_tool_calls(function_calls, session_id=session_id),
+                )
             )
 
         if cap_reached:
@@ -273,13 +226,14 @@ class _GeminiClient:
         self,
         user_message: str,
         system_prompt: str,
+        session_id: str,
     ) -> tuple[str, object]:
         """Native Gemini API call with an automatic ReAct tool-use loop."""
         contents = self._build_contents(user_message)
         config = types.GenerateContentConfig(
-            system_instruction=system_prompt, tools=_GEMINI_TOOLS
+            system_instruction=system_prompt, tools=GEMINI_TOOLS
         )
-        last_response = await self._react_loop(contents, config)
+        last_response = await self._react_loop(contents, config, session_id=session_id)
         text = getattr(last_response, "text", None)
         if not text or not text.strip():
             raise InvalidLLMResponseError("LLM returned empty content after tool loop")
@@ -299,8 +253,8 @@ class _GeminiClient:
 
 class LLMProvider:
     def __init__(self, store: SessionStore) -> None:
-        self._backend = _GeminiClient()
         self._store = store
+        self._backend = _GeminiClient(ToolExecutor(store))
         self.model = self._backend.model
 
     def _schedule_background(
@@ -337,7 +291,7 @@ class LLMProvider:
             log_llm_chat_completion(observation_name, usage)
             return content
 
-    async def _chat_with_tools(self, user_message: str) -> str:
+    async def _chat_with_tools(self, user_message: str, session_id: str) -> str:
         """Native Gemini path — used for interactive chat, supports tool calls."""
         langfuse = get_client()
         with langfuse.start_as_current_observation(
@@ -347,7 +301,7 @@ class LLMProvider:
         ) as gen:
             gen.update(input={"user_message": user_message})
             content, response = await self._backend.complete_with_tools(
-                user_message, _CHAT_SYSTEM_PROMPT
+                user_message, _CHAT_SYSTEM_PROMPT, session_id
             )
             usage = usage_details_for_langfuse(response)
             gen.update(output=content, usage_details=usage or {})
@@ -436,7 +390,7 @@ class LLMProvider:
                     "buffer_len": buffer_len,
                 })
 
-                reply = await self._chat_with_tools(user_turn)
+                reply = await self._chat_with_tools(user_turn, sid)
                 langfuse.update_current_span(output={"reply": reply})
 
                 async with self._store.session_lock(sid):

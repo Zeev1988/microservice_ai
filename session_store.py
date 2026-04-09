@@ -63,6 +63,10 @@ class SessionStore:
     def _rate_limit_key(action: str, client_id: str) -> str:
         return f"rate_limit:{action}:{client_id}"
 
+    @staticmethod
+    def _research_notes_key(session_id: str) -> str:
+        return f"session:notes:{session_id}"
+
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
@@ -83,6 +87,12 @@ class SessionStore:
             "buffer": [{"user": ex.user, "assistant": ex.assistant} for ex in state.buffer],
         })
         await self._redis.set(self._key(session_id), payload, ex=SESSION_TTL_SECONDS)
+
+    async def save_research_note(self, session_id: str, note: str) -> None:
+        """Append a research note to this session in Redis."""
+        key = self._research_notes_key(session_id)
+        await self._redis.rpush(key, note)
+        await self._redis.expire(key, SESSION_TTL_SECONDS)
 
     async def soft_delete_state(self, session_id: str) -> bool:
         """Soft-delete: archive live state for 24 h, then remove the live key.
