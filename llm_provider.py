@@ -1,10 +1,12 @@
 import asyncio
+import json
 import os
 import time
-from typing import Final
+from typing import Any, Callable, Final
 
 import httpx
 from google import genai
+from google.genai import types
 from google.genai.errors import ClientError
 from logging_setup import (
     log_llm_chat_completion,
@@ -30,8 +32,17 @@ from tracing import (
 )
 
 _CHAT_SYSTEM_PROMPT: Final[str] = (
-    "You are a helpful assistant. Use the provided conversation summary for "
-    "prior context. Answer the user's latest message concisely."
+    "You are an expert research assistant. Use the provided conversation summary "
+    "for prior context and answer the user's latest message concisely. You have "
+    "access to a tool named search_research_labs that can fetch lab names and "
+    "research topics. Be proactive: if the user asks about research topics, "
+    "specific labs, or factual information about academic/research institutions, "
+    "use search_research_labs instead of relying only on internal knowledge. "
+    "When the question does not require tool data, answer directly. "
+    "When faced with ambiguous requests such as 'interesting projects' or "
+    "'what should I explore', use the conversation summary and the user's "
+    "professional background to suggest 3 specific research areas. "
+    "Only call search_research_labs once the user has confirmed a focus area."
 )
 
 _SUMMARY_UPDATE_SYSTEM_PROMPT: Final[str] = (
@@ -44,9 +55,65 @@ _SUMMARY_UPDATE_SYSTEM_PROMPT: Final[str] = (
 
 _BUFFER_SIZE: Final[int] = 3  # exchanges before a summary flush is triggered
 
+_USER_CONTEXT: Final[str] = "Data Analyst based in Tel Aviv"
+
+_MAX_TOOL_ITERATIONS: Final[int] = 5  # guard against infinite tool loops
+
 
 class InvalidLLMResponseError(ValueError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions — add new tools here; register them in _TOOL_REGISTRY
+# ---------------------------------------------------------------------------
+
+def search_research_labs(query: str) -> list[dict[str, Any]]:
+    """Return a dummy list of AI research labs whose name or topics match *query*."""
+    labs = [
+        {"name": "DeepMind", "topics": ["reinforcement learning", "protein folding", "AlphaCode"]},
+        {"name": "Anthropic", "topics": ["AI safety", "constitutional AI", "interpretability"]},
+        {"name": "OpenAI", "topics": ["GPT", "DALL-E", "Sora", "reasoning"]},
+        {"name": "MIT CSAIL", "topics": ["robotics", "natural language processing", "computer vision"]},
+        {"name": "Stanford HAI", "topics": ["human-centered AI", "policy", "ethics"]},
+        {"name": "Google Brain / Google DeepMind", "topics": ["transformers", "diffusion models", "Gemini"]},
+        {"name": "CMU LTI", "topics": ["NLP", "dialogue systems", "multimodal AI"]},
+    ]
+    q = query.lower()
+    results = [
+        lab for lab in labs
+        if q in lab["name"].lower() or any(q in t for t in lab["topics"])
+    ]
+    return results or labs  # fall back to full list if nothing matches
+
+
+_TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
+    "search_research_labs": search_research_labs,
+}
+
+_GEMINI_TOOLS = [
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="search_research_labs",
+                description=(
+                    "Search for AI / ML research labs by name or topic. "
+                    "Returns a list of matching labs with their research focus areas."
+                ),
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "query": types.Schema(
+                            type=types.Type.STRING,
+                            description="Lab name, research topic, or keyword to search for.",
+                        )
+                    },
+                    required=["query"],
+                ),
+            )
+        ]
+    )
+]
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +179,79 @@ class _GeminiClient:
     async def complete_background(self, messages: list[dict[str, str]]) -> tuple[str, object]:
         return await _gemini_call_background(self._client, self.model, messages)
 
+    @staticmethod
+    def _build_contents(user_message: str) -> list[types.Content]:
+        """Wrap a plain user string into the native Gemini Content format."""
+        return [types.Content(role="user", parts=[types.Part.from_text(text=user_message)])]
+
+    @staticmethod
+    def _execute_tool_calls(
+        function_calls: list[Any],
+    ) -> list[types.Part]:
+        """Run every tool requested by the model and return the result parts."""
+        result_parts: list[types.Part] = []
+        for fc in function_calls:
+            fn = _TOOL_REGISTRY.get(fc.name)
+            tool_output: Any = fn(**dict(fc.args)) if fn else {"error": f"Unknown tool: {fc.name}"}
+            result_parts.append(
+                types.Part.from_function_response(
+                    name=fc.name,
+                    response={"result": json.dumps(tool_output)},
+                )
+            )
+        return result_parts
+
+    async def _react_loop(
+        self,
+        contents: list[types.Content],
+        config: types.GenerateContentConfig,
+    ) -> object:
+        """Drive the ReAct loop: call → tool-execute → repeat until model stops or cap hit."""
+        last_response: object = None
+        cap_reached = True
+        for _ in range(_MAX_TOOL_ITERATIONS):
+            response = await self._client.aio.models.generate_content(
+                model=self.model, contents=contents, config=config,
+            )
+            last_response = response
+
+            function_calls = [
+                part.function_call
+                for part in response.candidates[0].content.parts
+                if part.function_call is not None
+            ]
+            if not function_calls:
+                cap_reached = False
+                break
+
+            contents.append(response.candidates[0].content)
+            contents.append(
+                types.Content(role="user", parts=self._execute_tool_calls(function_calls))
+            )
+
+        if cap_reached:
+            import logging
+            logging.getLogger("llm").warning(
+                "tool_loop_cap_reached", extra={"max_iterations": _MAX_TOOL_ITERATIONS}
+            )
+        return last_response
+
+    async def complete_with_tools(
+        self,
+        user_message: str,
+        system_prompt: str,
+    ) -> tuple[str, object]:
+        """Native Gemini API call with an automatic ReAct tool-use loop."""
+        contents = self._build_contents(user_message)
+        config = types.GenerateContentConfig(
+            system_instruction=system_prompt, tools=_GEMINI_TOOLS
+        )
+        last_response = await self._react_loop(contents, config)
+        text = getattr(last_response, "text", None)
+        if not text or not text.strip():
+            raise InvalidLLMResponseError("LLM returned empty content after tool loop")
+        return text.strip(), last_response
+
     async def ping(self) -> None:
         await self._client.aio.chat.completions.create(
             model=self.model,
@@ -149,6 +289,7 @@ class LLMProvider:
         observation_name: str = "llm-completion",
         background: bool = False,
     ) -> str:
+        """OpenAI-compat path — used for background summary refresh (no tools)."""
         langfuse = get_client()
         with langfuse.start_as_current_observation(
             as_type="generation",
@@ -161,6 +302,23 @@ class LLMProvider:
             usage = usage_details_for_langfuse(response)
             gen.update(output=content, usage_details=usage or {})
             log_llm_chat_completion(observation_name, usage)
+            return content
+
+    async def _chat_with_tools(self, user_message: str) -> str:
+        """Native Gemini path — used for interactive chat, supports tool calls."""
+        langfuse = get_client()
+        with langfuse.start_as_current_observation(
+            as_type="generation",
+            name="llm-chat-reply",
+            model=self.model,
+        ) as gen:
+            gen.update(input={"user_message": user_message})
+            content, response = await self._backend.complete_with_tools(
+                user_message, _CHAT_SYSTEM_PROMPT
+            )
+            usage = usage_details_for_langfuse(response)
+            gen.update(output=content, usage_details=usage or {})
+            log_llm_chat_completion("llm-chat-reply", usage)
             return content
 
     async def update_rolling_summary(
@@ -232,24 +390,20 @@ class LLMProvider:
                     state = await self._store.get_state(sid)
                     summary, buffer_len = state.summary, len(state.buffer)
 
-                user_turn = (
-                    f"Conversation summary so far:\n{summary.strip()}\n\n"
-                    f"User message:\n{request.message}"
-                    if summary.strip() else request.message
+                context_block = f"User background: {_USER_CONTEXT}"
+                summary_block = (
+                    f"Conversation summary so far:\n{summary.strip()}"
+                    if summary.strip() else ""
                 )
+                preamble = "\n\n".join(filter(None, [context_block, summary_block]))
+                user_turn = f"{preamble}\n\nUser message:\n{request.message}"
                 langfuse.update_current_span(input={
                     "user_message": request.message,
                     "had_prior_summary": bool(summary.strip()),
                     "buffer_len": buffer_len,
                 })
 
-                reply = await self._chat_completion_text(
-                    [
-                        {"role": "system", "content": _CHAT_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_turn},
-                    ],
-                    observation_name="llm-chat-reply",
-                )
+                reply = await self._chat_with_tools(user_turn)
                 langfuse.update_current_span(output={"reply": reply})
 
                 async with self._store.session_lock(sid):
