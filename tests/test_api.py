@@ -11,6 +11,10 @@ from unittest.mock import patch
 
 from llm_provider import _GeminiClient
 
+
+def _raise_db_timeout(**_kwargs):
+    raise RuntimeError("DB timeout")
+
 VALID_KEY = "test-secret"
 HEADERS = {"X-API-Key": VALID_KEY}
 
@@ -83,8 +87,9 @@ async def test_chat_returns_200_when_tool_raises(client, stub_llm_provider):
     We bypass the stub's _chat_with_tools mock and exercise _execute_tool_calls
     directly to confirm the error path produces a structured Part (not a crash).
     """
-    with patch(
-        "llm_provider.search_research_labs", side_effect=RuntimeError("DB timeout")
+    with patch.dict(
+        "llm_provider._TOOL_REGISTRY",
+        {"search_research_labs": _raise_db_timeout},
     ):
         # Build a minimal fake function_call object.
         class _FakeFC:
