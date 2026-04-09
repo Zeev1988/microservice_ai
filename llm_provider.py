@@ -50,9 +50,9 @@ _CHAT_SYSTEM_PROMPT: Final[str] = (
     "If the user says a lab is interesting, proactively ask whether they want "
     "you to save a research note for this session, and use save_research_note "
     "only after the user confirms. "
-    "If the user asks about something they previously found interesting or wants "
-    "to recall earlier findings, use search_my_notes to retrieve relevant past notes "
-    "from their session before answering."
+    "If you cannot find an answer in the lab database, or the user asks about "
+    "something they previously found interesting, search the user's personal "
+    "research notes using search_my_notes before answering."
 )
 
 _SUMMARY_UPDATE_SYSTEM_PROMPT: Final[str] = (
