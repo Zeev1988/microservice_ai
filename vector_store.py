@@ -99,10 +99,11 @@ class VectorStore:
             where={"session_id": session_id},
             include=["documents", "distances"],
         )
+        ids = results.get("ids", [[]])[0]
         notes = results.get("documents", [[]])[0]
         distances = results.get("distances", [[]])[0]
         # Convert cosine distance → similarity score (0–1, higher = more relevant).
         return [
-            {"note": note, "similarity": round(1 - dist, 4)}
-            for note, dist in zip(notes, distances)
+            {"id": note_id, "content": note, "similarity": round(1 - dist, 4)}
+            for note_id, note, dist in zip(ids, notes, distances)
         ]

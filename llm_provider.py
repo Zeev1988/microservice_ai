@@ -52,7 +52,12 @@ _CHAT_SYSTEM_PROMPT: Final[str] = (
     "only after the user confirms. "
     "If you cannot find an answer in the lab database, or the user asks about "
     "something they previously found interesting, search the user's personal "
-    "research notes using search_my_notes before answering."
+    "research notes using search_my_notes before answering. "
+    "When using information retrieved from search_my_notes, you MUST cite the "
+    "source by its ID (e.g., [Source: <note_id>]). If a note contradicts a "
+    "result from search_research_labs, present both perspectives clearly. "
+    "Never state facts from personal notes as general knowledge; always "
+    "attribute them to the user's previous research."
 )
 
 _SUMMARY_UPDATE_SYSTEM_PROMPT: Final[str] = (
