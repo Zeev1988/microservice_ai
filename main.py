@@ -4,6 +4,8 @@ import hashlib
 import os
 
 import httpx
+from arq import create_pool
+from arq.connections import RedisSettings
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from google.genai.errors import ClientError
@@ -48,8 +50,12 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> str
 async def lifespan(app: FastAPI):
     store = SessionStore.from_env()
     vector_store = VectorStore.from_env()
-    app.state.provider = LLMProvider(store, vector_store)
+    arq_pool = await create_pool(
+        RedisSettings.from_dsn(os.getenv("REDIS_URL", "redis://localhost:6379"))
+    )
+    app.state.provider = LLMProvider(store, vector_store, arq_pool)
     yield
+    await arq_pool.aclose()
     await store.close()
     get_client().shutdown()
 

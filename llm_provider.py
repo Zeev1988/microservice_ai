@@ -291,22 +291,45 @@ class _GeminiClient:
 # ---------------------------------------------------------------------------
 
 class LLMProvider:
-    def __init__(self, store: SessionStore, vector_store: VectorStore) -> None:
+    def __init__(
+        self,
+        store: SessionStore,
+        vector_store: VectorStore,
+        arq_pool: Any = None,
+    ) -> None:
         self._store = store
         self._backend = _GeminiClient(ToolExecutor(store, vector_store))
         self.model = self._backend.model
+        self._arq_pool = arq_pool
 
     def _schedule_background(
         self, session_id: str, snapshot_summary: str, snapshot_buffer: list[Exchange]
     ) -> None:
-        """Fire-and-forget the summary refresh, keeping it on the current trace."""
-        ctx = otel_context_current()
-        asyncio.create_task(
-            self._run_in_context(
-                ctx,
-                self._background_refresh_summary(session_id, snapshot_summary, snapshot_buffer),
+        """Enqueue the summary refresh via ARQ when a pool is available.
+
+        Falls back to asyncio.create_task for local/test environments where no
+        ARQ worker is running. The ARQ path is crash-safe: the job is persisted
+        in Redis before the current request completes, so it survives a worker
+        restart. The fallback path is best-effort only.
+        """
+        if self._arq_pool is not None:
+            serialized = [
+                {"user": ex.user, "assistant": ex.assistant}
+                for ex in snapshot_buffer
+            ]
+            asyncio.create_task(
+                self._arq_pool.enqueue_job(
+                    "refresh_summary", session_id, snapshot_summary, serialized
+                )
             )
-        )
+        else:
+            ctx = otel_context_current()
+            asyncio.create_task(
+                self._run_in_context(
+                    ctx,
+                    self._background_refresh_summary(session_id, snapshot_summary, snapshot_buffer),
+                )
+            )
 
     async def _chat_completion_text(
         self,
